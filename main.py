@@ -1,18 +1,64 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import requests
+# Standard library imports
 import logging
 import os
-import shutil
-from pydantic import BaseModel
+import uuid
+from contextlib import asynccontextmanager
 from html import escape
-from typing import List, Optional
+from typing import List, Optional # Optional can be removed if not used
+
+# Third-party imports
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
+from dotenv import load_dotenv
+import torch
+import torchaudio
+
+# Application-specific imports
+from ChatTTS.chat import ChatTTS
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv()
+logger = logging.getLogger(__name__) # Define logger globally
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the ML model
+    logger.info("Initializing ChatTTS model...")
+    try:
+        # Check for GPU availability and log it
+        if torch.cuda.is_available():
+            logger.info(f"PyTorch CUDA is available. Device: {torch.cuda.get_device_name(0)}")
+        else:
+            logger.info("PyTorch CUDA is not available. Using CPU for ChatTTS.")
+
+        app.state.chattts_model = ChatTTS.Chat()
+        # chat.load() is often called implicitly or can be called explicitly.
+        # The default behavior of ChatTTS.Chat() should handle loading.
+        # If specific loading like chat.load(compile=True) is needed, it can be added here.
+        # For now, direct initialization is assumed to be sufficient based on docs.
+        logger.info("ChatTTS model initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize ChatTTS model: {e}")
+        app.state.chattts_model = None # Indicate failure
+    yield
+    # Clean up the ML model and release the resources
+    logger.info("Cleaning up ChatTTS model (if any)...")
+    if hasattr(app.state, 'chattts_model') and app.state.chattts_model is not None:
+        # Add cleanup code here if ChatTTS library provides explicit deallocation methods
+        # For now, just dereference
+        app.state.chattts_model = None
+        logger.info("ChatTTS model resources released (simulated).")
+
+app = FastAPI(lifespan=lifespan)
+
+# Mount static files directory
+app.mount("/static/wavs", StaticFiles(directory="static/wavs"), name="static_wavs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,86 +91,97 @@ class TTSResponse(BaseModel):
     audio_files: List[AudioFile]
 
 
-@app.post("/tts", response_model=TTSResponse) # Added response_model
-async def create_tts_request(request_data: TTSRequest):
-    logger = logging.getLogger(__name__)
-    
+@app.post("/tts", response_model=TTSResponse) # Add response_model back
+async def create_tts_request(request: Request, request_data: TTSRequest):
+    # logger = logging.getLogger(__name__) # Global logger is already defined and accessible
+    global logger # Make it explicit that we are using the global logger
+
+    chat = request.app.state.chattts_model
+    if chat is None:
+        logger.error("ChatTTS model not available.")
+        return JSONResponse(status_code=503, content={"code": 1, "msg": "error"})
+
     # Ensure text is a string before escaping, default to empty string if not
     text_to_sanitize = request_data.text if isinstance(request_data.text, str) else ""
     sanitized_text = escape(text_to_sanitize)
     logger.info(f"Received TTS request: voice='{request_data.voice}', temp='{request_data.temperature}', text='{sanitized_text}'")
 
-    chat_tts_payload = {
-        "text": sanitized_text,
+    params_infer = {
+        "text": [sanitized_text], # Must be a list
+        "use_prompt": True if request_data.prompt else False,
         "prompt": request_data.prompt,
-        "voice": request_data.voice,
         "temperature": request_data.temperature,
-        "top_p": request_data.top_p,
-        "top_k": request_data.top_k,
-        "skip_refine": request_data.skip_refine,
-        "custom_voice": request_data.custom_voice,
+        "top_P": request_data.top_p,
+        "top_K": request_data.top_k,
+        "skip_refine": bool(request_data.skip_refine),
+        "lang": "EN"
     }
+    
+    rand_spk_arg = None
+    try:
+        voice_seed = int(request_data.voice)
+        rand_spk_arg = chat.sample_random_speaker(seed=voice_seed)
+        logger.info(f"Using voice ID {voice_seed} to generate speaker embedding for ChatTTS.")
+    except ValueError:
+        if request_data.voice and request_data.voice.lower() not in ['default', '']:
+            logger.warning(f"Voice ID '{request_data.voice}' is not an integer. Using default/random speaker for ChatTTS.")
+    
+    if rand_spk_arg is not None:
+        params_infer["rand_spk"] = rand_spk_arg
 
-    logger.info(f"Sending payload to ChatTTS: {chat_tts_payload}")
-    chat_tts_url = "http://127.0.0.1:9966/tts"
+    # Construct a string for logging that omits the full rand_spk if it's large
+    log_params = {k: v for k, v in params_infer.items() if k != "rand_spk"}
+    if "rand_spk" in params_infer and params_infer["rand_spk"] is not None:
+        log_params["rand_spk_shape"] = params_infer["rand_spk"].shape # Log shape instead of full tensor
+    logger.info(f"Calling ChatTTS.infer with params: {log_params}")
 
     try:
-        response = requests.post(chat_tts_url, json=chat_tts_payload)
-        logger.info(f"ChatTTS response status code: {response.status_code}")
-        # Limiting log of content to first 500 chars for brevity
-        logger.debug(f"ChatTTS response content: {response.text[:500]}")
+        wavs = chat.infer(**params_infer)
+    except Exception as e:
+        logger.error(f"Error during ChatTTS inference: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
 
-        if response.status_code == 200:
-            try:
-                response_json = response.json() # Attempt to parse JSON
-                logger.info(f"ChatTTS request successful, JSON response received: {response_json}")
+    output_dir = "static/wavs"
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        logger.error(f"Error creating output directory {output_dir}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
 
-                filename = response_json.get('filename')
-                if not filename or not isinstance(filename, str):
-                    logger.error(f"ChatTTS response missing or invalid filename: {filename}")
-                    return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
+    filename = f"{uuid.uuid4()}.wav"
+    filepath = os.path.join(output_dir, filename)
 
-                target_dir = "E:/python/chattts/static/wavs/"
-                try:
-                    os.makedirs(target_dir, exist_ok=True)
-                    logger.info(f"Ensured directory exists: {target_dir}")
-                except OSError as e:
-                    logger.error(f"Error creating directory {target_dir}: {e}")
-                    return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
+    try:
+        # wavs is a list of tensors. Save the first one.
+        if not wavs or not isinstance(wavs, list) or not len(wavs[0]): # Check from prompt
+             logger.error(f"ChatTTS inference returned empty or invalid result: {wavs}")
+             return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
+        torchaudio.save(filepath, wavs[0], 24000)  # ChatTTS default sample rate is 24k
+        logger.info(f"Audio saved to {filepath}")
+    except Exception as e:
+        logger.error(f"Error saving audio to {filepath}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
+    
+    # Construct the full URL for the audio file
+    scheme = request.url.scheme
+    hostname = request.url.hostname
+    port = request.url.port
+    
+    if port:
+        full_url = f"{scheme}://{hostname}:{port}/static/wavs/{filename}"
+    else: # Port might be None for standard 80/443
+        full_url = f"{scheme}://{hostname}/static/wavs/{filename}"
+        
+    logger.info(f"Constructed audio URL: {full_url}")
 
-                source_audio_url = f"http://127.0.0.1:9966/static/wavs/{filename}"
-                logger.info(f"Attempting to download audio from: {source_audio_url}")
+    return TTSResponse(
+        code=0,
+        msg="ok",
+        audio_files=[AudioFile(filename=filename, url=full_url)]
+    )
 
-                try:
-                    audio_response = requests.get(source_audio_url, stream=True)
-                    audio_response.raise_for_status()  # Raises an HTTPError for bad responses (4XX or 5XX)
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Error downloading audio from {source_audio_url}: {e}")
-                    return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
-
-                target_file_path = os.path.join(target_dir, filename)
-                
-                try:
-                    with open(target_file_path, 'wb') as f:
-                        shutil.copyfileobj(audio_response.raw, f)
-                    logger.info(f"Successfully saved audio file to {target_file_path}")
-                except IOError as e:
-                    logger.error(f"Error saving audio file to {target_file_path}: {e}")
-                    return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
-                
-                return TTSResponse(code=0, msg="ok", audio_files=[AudioFile(filename=filename, url=source_audio_url)])
-
-            except ValueError as e: # For response.json() failing
-                logger.error(f"Error parsing ChatTTS JSON response: {e}")
-                return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
-        else: # status_code != 200
-            logger.error(f"Error from ChatTTS service. Status: {response.status_code}, Body: {response.text[:500]}")
-            return JSONResponse(status_code=500, content={"code": 1, "msg": "error"})
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error calling ChatTTS: {e}")
-        return JSONResponse(status_code=502, content={"code": 1, "msg": "error"})
-    # A general except Exception is not added here to stick to specified error handling.
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host=HOST, port=PORT)
