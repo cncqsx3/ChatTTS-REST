@@ -18,7 +18,7 @@ import torch
 import torchaudio
 
 # Application-specific imports
-from ChatTTS.chat import ChatTTS
+import ChatTTS
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -117,22 +117,29 @@ async def create_tts_request(request: Request, request_data: TTSRequest):
         "lang": "EN"
     }
     
+    voice_seed = None
     rand_spk_arg = None
-    try:
-        voice_seed = int(request_data.voice)
-        rand_spk_arg = chat.sample_random_speaker(seed=voice_seed)
-        logger.info(f"Using voice ID {voice_seed} to generate speaker embedding for ChatTTS.")
-    except ValueError:
-        if request_data.voice and request_data.voice.lower() not in ['default', '']:
-            logger.warning(f"Voice ID '{request_data.voice}' is not an integer. Using default/random speaker for ChatTTS.")
+    if request_data.voice and request_data.voice.lower() not in ['default', '']:
+        try:
+            voice_seed = int(request_data.voice)
+        except ValueError:
+            logger.warning(f"Voice ID '{request_data.voice}' is not a valid integer. Proceeding without specific speaker embedding.")
     
-    if rand_spk_arg is not None:
-        params_infer["rand_spk"] = rand_spk_arg
+    if voice_seed is not None:
+        try:
+            rand_spk_arg = chat.sample_random_speaker(seed=voice_seed)
+            logger.info(f"Using voice ID {voice_seed} to generate speaker embedding.")
+        except Exception as e:
+            logger.error(f"Error sampling random speaker with seed {voice_seed}: {e}", exc_info=True)
+            # Proceeding without speaker embedding if sampling fails
 
-    # Construct a string for logging that omits the full rand_spk if it's large
-    log_params = {k: v for k, v in params_infer.items() if k != "rand_spk"}
-    if "rand_spk" in params_infer and params_infer["rand_spk"] is not None:
-        log_params["rand_spk_shape"] = params_infer["rand_spk"].shape # Log shape instead of full tensor
+    if rand_spk_arg is not None:
+        params_infer["speaker_prompt"] = rand_spk_arg # Corrected key
+
+    # Construct a string for logging that omits the full speaker_prompt if it's large
+    log_params = {k: v for k, v in params_infer.items() if k != "speaker_prompt"}
+    if "speaker_prompt" in params_infer and params_infer["speaker_prompt"] is not None:
+        log_params["speaker_prompt_shape"] = params_infer["speaker_prompt"].shape # Log shape
     logger.info(f"Calling ChatTTS.infer with params: {log_params}")
 
     try:
